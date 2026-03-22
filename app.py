@@ -12,23 +12,19 @@ from pytrends.request import TrendReq
 from pywebpush import webpush, WebPushException
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ── VAPID config (set as Render environment variables) ────────────────────────
 VAPID_PRIVATE_KEY  = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY   = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIMS_EMAIL = os.environ.get("VAPID_CLAIMS_EMAIL", "mailto:admin@example.com")
 
-# ── in-memory subscription store ─────────────────────────────────────────────
-# Resets on redeploy — fine for a team dashboard.
-# For persistence swap for a SQLite file or Render's free Redis add-on.
-SUBSCRIPTIONS: dict = {}   # endpoint → full subscription object
-_sub_lock = threading.Lock()
-
-# ── trends cache ──────────────────────────────────────────────────────────────
-CACHE     = {}
-CACHE_TTL = 360
-_lock     = threading.Lock()
+# ── in-memory stores ──────────────────────────────────────────────────────────
+SUBSCRIPTIONS = {}
+_sub_lock     = threading.Lock()
+CACHE         = {}
+CACHE_TTL     = 360
+_lock         = threading.Lock()
 
 pytrends = TrendReq(hl="en-IN", tz=330, timeout=(10, 30), retries=2, backoff_factor=1.0)
 
@@ -124,26 +120,21 @@ def build_all_data():
     print(f"[{datetime.now().isoformat()}] Refresh complete.")
     return payload
 
-# ── push notification helpers ─────────────────────────────────────────────────
+# ── push helpers ──────────────────────────────────────────────────────────────
 
 def _build_digest_payload(data):
-    """Build the JSON payload sent to every subscriber."""
     trending   = data.get("trending_searches", [])[:3]
     ipl_rising = data.get("ipl_related", {}).get("rising", [])[:2]
     breakouts  = [r["query"] for r in ipl_rising if r.get("query")]
-
-    top_str      = ", ".join(trending) if trending else "No data"
-    breakout_str = ", ".join(breakouts) if breakouts else None
-    ts           = data.get("refreshed_at", "")
+    top_str    = ", ".join(trending) if trending else "No data"
+    ts         = data.get("refreshed_at", "")
     try:
         time_str = datetime.fromisoformat(ts).strftime("%I:%M %p IST")
     except Exception:
         time_str = ""
-
     body = f"Trending: {top_str}"
-    if breakout_str:
-        body += f"\nBreakouts: {breakout_str}"
-
+    if breakouts:
+        body += f"\nBreakouts: {', '.join(breakouts)}"
     return {
         "title": f"India Sports Trends · {time_str}",
         "body":  body,
@@ -157,12 +148,9 @@ def send_push_to_all(payload):
     if not VAPID_PRIVATE_KEY:
         print("[push] VAPID_PRIVATE_KEY not set — skipping.")
         return
-
     with _sub_lock:
         subs = dict(SUBSCRIPTIONS)
-
-    stale = []
-    sent  = 0
+    stale, sent = [], 0
     for endpoint, sub in subs.items():
         try:
             webpush(
@@ -173,20 +161,16 @@ def send_push_to_all(payload):
             )
             sent += 1
         except WebPushException as e:
-            status = e.response.status_code if e.response else 0
-            if status in (404, 410):
+            if e.response and e.response.status_code in (404, 410):
                 stale.append(endpoint)
             else:
-                print(f"[push] Failed ({status}): {e}")
+                print(f"[push] Failed: {e}")
         except Exception as e:
             print(f"[push] Error: {e}")
-
     if stale:
         with _sub_lock:
             for ep in stale:
                 SUBSCRIPTIONS.pop(ep, None)
-        print(f"[push] Removed {len(stale)} stale subscriptions.")
-
     print(f"[push] Sent to {sent}/{len(subs)} subscribers.")
 
 # ── background threads ────────────────────────────────────────────────────────
@@ -203,30 +187,35 @@ def refresh_loop():
         time.sleep(CACHE_TTL)
 
 def hourly_push_loop():
-    """Wait for cache, then fire push at the top of every hour."""
     while True:
         with _lock:
             ready = bool(CACHE)
         if ready:
             break
         time.sleep(10)
-
     while True:
         now = datetime.now()
-        seconds_to_next_hour = 3600 - (now.minute * 60 + now.second)
-        print(f"[push] Next hourly digest in {seconds_to_next_hour}s")
-        time.sleep(seconds_to_next_hour)
+        time.sleep(3600 - (now.minute * 60 + now.second))
         with _lock:
             data = dict(CACHE)
         if data:
-            payload = _build_digest_payload(data)
-            send_push_to_all(payload)
+            send_push_to_all(_build_digest_payload(data))
 
+# Start background threads — no blocking sleep so gunicorn starts instantly
 threading.Thread(target=refresh_loop,     daemon=True).start()
 threading.Thread(target=hourly_push_loop, daemon=True).start()
-time.sleep(2)
 
 # ── routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    """Root route — prevents Render health checker 404s that trigger restarts."""
+    with _lock:
+        return jsonify({
+            "service":         "India Sports Trends API",
+            "status":          "ok",
+            "cache_populated": bool(CACHE),
+        })
 
 @app.route("/api/health")
 def health():
@@ -267,14 +256,13 @@ def push_unsubscribe():
 
 @app.route("/api/push/test", methods=["POST"])
 def push_test():
-    """Sends an immediate test push to all subscribers."""
     with _lock:
         data = dict(CACHE)
     if not data:
         return jsonify({"error": "Cache not ready yet"}), 503
     payload = _build_digest_payload(data)
     payload["title"] = "Test · India Sports Trends"
-    payload["body"]  = "Push notifications are working correctly on your device."
+    payload["body"]  = "Push notifications are working correctly."
     threading.Thread(target=send_push_to_all, args=(payload,), daemon=True).start()
     return jsonify({"ok": True, "subscribers": len(SUBSCRIPTIONS)})
 
@@ -288,33 +276,41 @@ def all_trends():
 @app.route("/api/trends/ipl")
 def ipl_trends():
     with _lock:
-        return jsonify({"teams": CACHE.get("ipl_teams", {}),
-                        "interest": CACHE.get("sport_interest", {}).get("ipl", {}),
-                        "related": CACHE.get("ipl_related", {}),
-                        "refreshed_at": CACHE.get("refreshed_at")})
+        return jsonify({
+            "teams":        CACHE.get("ipl_teams", {}),
+            "interest":     CACHE.get("sport_interest", {}).get("ipl", {}),
+            "related":      CACHE.get("ipl_related", {}),
+            "refreshed_at": CACHE.get("refreshed_at"),
+        })
 
 @app.route("/api/trends/sport/<sport>")
 def sport_trends(sport):
     if sport not in SPORT_TOPICS:
         return jsonify({"error": f"Valid sports: {list(SPORT_TOPICS.keys())}"}), 400
     with _lock:
-        return jsonify({"sport": sport,
-                        "interest": CACHE.get("sport_interest", {}).get(sport, {}),
-                        "refreshed_at": CACHE.get("refreshed_at")})
+        return jsonify({
+            "sport":        sport,
+            "interest":     CACHE.get("sport_interest", {}).get(sport, {}),
+            "refreshed_at": CACHE.get("refreshed_at"),
+        })
 
 @app.route("/api/trends/breakouts")
 def breakouts_route():
     with _lock:
-        return jsonify({"ipl_rising": CACHE.get("ipl_related", {}).get("rising", []),
-                        "cricket_rising": CACHE.get("cricket_related", {}).get("rising", []),
-                        "trending": CACHE.get("trending_searches", [])[:10],
-                        "refreshed_at": CACHE.get("refreshed_at")})
+        return jsonify({
+            "ipl_rising":     CACHE.get("ipl_related",     {}).get("rising", []),
+            "cricket_rising": CACHE.get("cricket_related", {}).get("rising", []),
+            "trending":       CACHE.get("trending_searches", [])[:10],
+            "refreshed_at":   CACHE.get("refreshed_at"),
+        })
 
 @app.route("/api/trends/realtime")
 def realtime():
     with _lock:
-        return jsonify({"stories": CACHE.get("realtime", []),
-                        "refreshed_at": CACHE.get("refreshed_at")})
+        return jsonify({
+            "stories":      CACHE.get("realtime", []),
+            "refreshed_at": CACHE.get("refreshed_at"),
+        })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
