@@ -14,17 +14,28 @@ from pywebpush import webpush, WebPushException
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ── VAPID config (set as Render environment variables) ────────────────────────
 VAPID_PRIVATE_KEY  = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY   = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIMS_EMAIL = os.environ.get("VAPID_CLAIMS_EMAIL", "mailto:admin@example.com")
 
-# ── in-memory stores ──────────────────────────────────────────────────────────
 SUBSCRIPTIONS = {}
 _sub_lock     = threading.Lock()
-CACHE         = {}
-CACHE_TTL     = 360
 _lock         = threading.Lock()
+CACHE_TTL     = 360
+
+# ── Stub cache — populated immediately so health check never returns false ────
+# Real data overwrites this as soon as the first Google Trends fetch completes.
+CACHE = {
+    "refreshed_at":     None,
+    "geo":              "IN",
+    "trending_searches": [],
+    "sport_interest":   {},
+    "ipl_teams":        {},
+    "ipl_related":      {"top": [], "rising": []},
+    "cricket_related":  {"top": [], "rising": []},
+    "realtime":         [],
+    "_stub":            True,   # flag so we know real data hasn't arrived yet
+}
 
 pytrends = TrendReq(hl="en-IN", tz=330, timeout=(10, 30), retries=2, backoff_factor=1.0)
 
@@ -94,29 +105,46 @@ def _fetch_ipl_team_interest():
         data  = _fetch_interest_over_time(batch)
         for team, vals in data.items():
             results[team] = max(vals) if vals else 0
-        time.sleep(2)
+        time.sleep(1)
     if results:
         mx = max(results.values()) or 1
         results = {k: round(v / mx * 100) for k, v in results.items()}
     return results
 
-def build_all_data():
-    print(f"[{datetime.now().isoformat()}] Refreshing trends data...")
+def build_all_data(fast=False):
+    """
+    fast=True: minimal sleep delays for the first fetch so it completes
+               before Render's 60-second health check window expires.
+    fast=False: normal polite delays for subsequent refreshes.
+    """
+    delay = 1 if fast else 2
+    print(f"[{datetime.now().isoformat()}] Refreshing trends data... (fast={fast})")
     payload = {"refreshed_at": datetime.now().isoformat(), "geo": "IN"}
+
     payload["trending_searches"] = _fetch_trending_searches()
-    time.sleep(2)
+    time.sleep(delay)
+
     sport_interest = {}
-    for sport, kws in SPORT_TOPICS.items():
-        sport_interest[sport] = _fetch_interest_over_time(kws[:3])
-        time.sleep(2)
+    # On fast mode only fetch 2 sports to stay under 60s
+    topics = list(SPORT_TOPICS.items())[:2] if fast else list(SPORT_TOPICS.items())
+    for sport, kws in topics:
+        sport_interest[sport] = _fetch_interest_over_time(kws[:2] if fast else kws[:3])
+        time.sleep(delay)
+
+    # Fill remaining sports with empty on fast mode — real fetch will overwrite
+    for sport in SPORT_TOPICS:
+        if sport not in sport_interest:
+            sport_interest[sport] = {}
+
     payload["sport_interest"]  = sport_interest
     payload["ipl_teams"]       = _fetch_ipl_team_interest()
-    time.sleep(2)
+    time.sleep(delay)
     payload["ipl_related"]     = _fetch_related_queries("IPL 2026")
-    time.sleep(2)
+    time.sleep(delay)
     payload["cricket_related"] = _fetch_related_queries("India cricket")
-    time.sleep(2)
+    time.sleep(delay)
     payload["realtime"]        = _fetch_realtime_trending()
+
     print(f"[{datetime.now().isoformat()}] Refresh complete.")
     return payload
 
@@ -177,19 +205,23 @@ def send_push_to_all(payload):
 
 def refresh_loop():
     global CACHE
+    first = True
     while True:
         try:
-            data = build_all_data()
+            data = build_all_data(fast=first)
+            first = False
             with _lock:
+                data.pop("_stub", None)
                 CACHE = data
         except Exception:
             traceback.print_exc()
         time.sleep(CACHE_TTL)
 
 def hourly_push_loop():
+    # Wait until real data has arrived (stub flag gone)
     while True:
         with _lock:
-            ready = bool(CACHE)
+            ready = bool(CACHE) and not CACHE.get("_stub")
         if ready:
             break
         time.sleep(10)
@@ -198,10 +230,9 @@ def hourly_push_loop():
         time.sleep(3600 - (now.minute * 60 + now.second))
         with _lock:
             data = dict(CACHE)
-        if data:
+        if data and not data.get("_stub"):
             send_push_to_all(_build_digest_payload(data))
 
-# Start background threads — no blocking sleep so gunicorn starts instantly
 threading.Thread(target=refresh_loop,     daemon=True).start()
 threading.Thread(target=hourly_push_loop, daemon=True).start()
 
@@ -209,12 +240,11 @@ threading.Thread(target=hourly_push_loop, daemon=True).start()
 
 @app.route("/")
 def index():
-    """Root route — prevents Render health checker 404s that trigger restarts."""
     with _lock:
         return jsonify({
             "service":         "India Sports Trends API",
             "status":          "ok",
-            "cache_populated": bool(CACHE),
+            "cache_populated": bool(CACHE) and not CACHE.get("_stub"),
         })
 
 @app.route("/api/health")
@@ -222,9 +252,10 @@ def health():
     with _lock:
         with _sub_lock:
             sub_count = len(SUBSCRIPTIONS)
+        is_ready = bool(CACHE) and not CACHE.get("_stub")
         return jsonify({
             "status":           "ok",
-            "cache_populated":  bool(CACHE),
+            "cache_populated":  is_ready,
             "refreshed_at":     CACHE.get("refreshed_at"),
             "subscribers":      sub_count,
             "vapid_configured": bool(VAPID_PUBLIC_KEY),
@@ -258,8 +289,8 @@ def push_unsubscribe():
 def push_test():
     with _lock:
         data = dict(CACHE)
-    if not data:
-        return jsonify({"error": "Cache not ready yet"}), 503
+    if not data or data.get("_stub"):
+        return jsonify({"error": "Cache not ready yet — real data still loading"}), 503
     payload = _build_digest_payload(data)
     payload["title"] = "Test · India Sports Trends"
     payload["body"]  = "Push notifications are working correctly."
@@ -269,8 +300,8 @@ def push_test():
 @app.route("/api/trends")
 def all_trends():
     with _lock:
-        if not CACHE:
-            return jsonify({"error": "Data loading, retry in 60s"}), 503
+        if not CACHE or CACHE.get("_stub"):
+            return jsonify({"error": "Data loading, retry in 30s"}), 503
         return jsonify(CACHE)
 
 @app.route("/api/trends/ipl")
