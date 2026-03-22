@@ -4,3 +4,4 @@ pytrends>=4.9.2
 gunicorn>=21.2.0
 pywebpush>=2.0.0
 py-vapid>=1.9.0
+urllib3<2.0.0
